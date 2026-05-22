@@ -1,0 +1,1801 @@
+---
+title: "MPH epistasis analysis notebook"
+output:
+  html_document:
+    code_folding: "hide"
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+    number_sections: true
+    theme: lumen
+---
+
+<style type="text/css">
+
+body{ /* Normal  */
+      font-size: 16px;
+  }
+td {  /* Table  */
+  font-size: 16px;
+}
+h1.title {
+  font-size: 28px;
+}
+h1 { /* Header 1 */
+  font-size: 24px;
+}
+h2 { /* Header 2 */
+    font-size: 22px;
+}
+h3 { /* Header 3 */
+  font-size: 20px;
+}
+code.r{ /* Code block */
+    font-size: 12px;
+}
+pre { /* Code block - determines code spacing between lines */
+    font-size: 14px;
+}
+</style>
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, error = FALSE, message = FALSE)
+
+if (!require('tidyverse')) install.packages('tidyverse'); library('tidyverse') # for everything
+if (!require('factoextra')) install.packages('factoextra'); library('factoextra') # for PCA
+if (!require('ggpubr')) install.packages('ggpubr'); library('ggpubr') # for paired plots
+if (!require('ggrepel')) install.packages('ggrepel'); library('ggrepel') # for labels
+if (!require('ggpubr')) install.packages('ggpubr'); library('ggpubr') # for paired plots
+if (!require('gridExtra')) install.packages('gridExtra'); library('gridExtra') # for arranging
+if (!require('scales')) install.packages('scales'); library('scales') # for muted colors
+
+golden = "#edae49" # Color choice
+```
+
+# First analysis
+
+*<Insert better overview here later>*
+
+Taking the Anc2 256 landscape and the Anc5 32 landscape files. The csvs are laid out such that each of the 8 positions is marked as '0' for wt and '1' for mutant. Then, experimental replicate rates are listed in M s-1 OD-1 of PNP formation per OD of induced cells from the lysate. I used 15000 M-1 cm-1 for the extinction coefficient for PNP which was empirically determined for pH 7.5 buffer (unlike 18000 reported in literature).
+
+All initial rates were determined in Prism using linear fits. Replicates that showed high noise were removed, leaving data ranging from 1-10+ replicates, with the majority around n=3. Note: "initial rates" may be taken at the initial time points, or in the middle of the reaction due to "burst" or "lag" phases noted in the data. These differed among variants.
+
+**FOR NOW burst and lag qualitative data is not annotated in the data**
+
+## Import CSVs
+
+```{r}
+# List all CSV files in the directory
+anc2 <- read_csv('anc2_rates_unclean.csv')
+anc5 <- read_csv('anc5_rates_unclean.csv')
+```
+
+## Obtaining SMEs
+
+First define the functions. Normalization to wt and log transform included here.
+
+```{r}
+library(tidyverse)
+
+calculate_single_mutational_effects <- function(data, positions = NULL) {
+  # If positions not specified, use all position columns (assuming they start with 'p')
+  if (is.null(positions)) {
+    positions <- names(data)[grepl("^p", names(data))]
+  }
+  
+  # Get experimental columns
+  exp_cols <- names(data)[grepl("^exp", names(data))]
+  
+  # Calculate stats for all genotypes
+  genotype_stats <- data %>%
+    select(all_of(c(positions, exp_cols))) %>%
+    # Create a genotype identifier
+    unite("genotype", all_of(positions), sep = "", remove = FALSE) %>%
+    group_by(genotype, across(all_of(positions))) %>%
+    summarise(
+      across(all_of(exp_cols), ~ list(.x[!is.na(.x)])),
+      .groups = "drop"
+    ) %>%
+    rowwise() %>%
+    mutate(
+      all_exp_values = list(unlist(c_across(all_of(exp_cols)))),
+      mean_rate = ifelse(length(all_exp_values) > 0, mean(all_exp_values), NA),
+      sd_rate = ifelse(length(all_exp_values) > 1, sd(all_exp_values), NA),
+      sem_rate = ifelse(length(all_exp_values) > 1, sd(all_exp_values) / sqrt(length(all_exp_values)), NA),
+      cv_rate = ifelse(!is.na(mean_rate) & mean_rate != 0 & !is.na(sd_rate), sd_rate / abs(mean_rate), NA),
+      n_obs = length(all_exp_values) # This might be counting NAs
+    ) %>%
+    select(-all_of(exp_cols), -all_exp_values) %>%
+    ungroup()
+  
+  # Find the all-wild-type background (all positions = 0)
+  all_wt_genotype <- paste0(rep("0", length(positions)), collapse = "")
+  wt_reference <- genotype_stats %>%
+    filter(genotype == all_wt_genotype)
+  
+  if (nrow(wt_reference) != 1 || is.na(wt_reference$mean_rate)) {
+    stop("Could not find valid all-wild-type reference genotype")
+  }
+  
+  # Calculate single mutational effects
+  results <- tibble()
+  
+  for (i in seq_along(positions)) {
+    pos_name <- positions[i]
+    other_positions <- positions[-i]
+    
+    # Get all unique backgrounds for the other positions
+    if (length(other_positions) > 0) {
+      backgrounds <- genotype_stats %>%
+        select(all_of(other_positions)) %>%
+        distinct()
+      
+      for (j in 1:nrow(backgrounds)) {
+        background_row <- backgrounds[j, ]
+        
+        # Find matching genotypes
+        wt_condition <- genotype_stats
+        mut_condition <- genotype_stats
+        
+        # Filter by background
+        for (pos in other_positions) {
+          wt_condition <- wt_condition %>% filter(!!sym(pos) == background_row[[pos]])
+          mut_condition <- mut_condition %>% filter(!!sym(pos) == background_row[[pos]])
+        }
+        
+        # Filter by target position
+        wt_condition <- wt_condition %>% filter(!!sym(pos_name) == 0)
+        mut_condition <- mut_condition %>% filter(!!sym(pos_name) == 1)
+        
+        if (nrow(wt_condition) == 1 && nrow(mut_condition) == 1 && 
+            !is.na(wt_condition$mean_rate) && !is.na(mut_condition$mean_rate) &&
+            wt_condition$mean_rate > 0 && mut_condition$mean_rate > 0) {
+          
+          # Calculate fold change relative to all-WT background
+          wt_fold_change <- wt_condition$mean_rate / wt_reference$mean_rate
+          mut_fold_change <- mut_condition$mean_rate / wt_reference$mean_rate
+          
+          # Calculate the ratio (mutant fold change / WT fold change)
+          effect_ratio <- mut_fold_change / wt_fold_change
+          
+          # Error propagation for ratios
+          # For wt_fold_change = wt_condition / wt_reference
+          cv_wt_fold <- sqrt(wt_condition$cv_rate^2 + wt_reference$cv_rate^2)
+          sd_wt_fold <- wt_fold_change * cv_wt_fold
+          
+          # For mut_fold_change = mut_condition / wt_reference  
+          cv_mut_fold <- sqrt(mut_condition$cv_rate^2 + wt_reference$cv_rate^2)
+          sd_mut_fold <- mut_fold_change * cv_mut_fold
+          
+          # For effect_ratio = mut_fold_change / wt_fold_change
+          cv_effect_ratio <- sqrt(cv_mut_fold^2 + cv_wt_fold^2)
+          effect_sd <- effect_ratio * cv_effect_ratio
+          
+          # Calculate SEM for the ratio (approximate - assumes independent measurements)
+          # This is an approximation since we're combining different sample sizes
+          effective_n <- min(wt_condition$n_obs, mut_condition$n_obs, wt_reference$n_obs)
+          effect_sem <- effect_sd / sqrt(effective_n)
+          
+          # Log-transformed values (log10 instead of log2)
+          log_effect <- log10(effect_ratio)
+          # For log transformation: SD_log = SD_ratio / (ratio * ln(10)) for log10
+          log_effect_sd <- effect_sd / (effect_ratio * log(10))
+          log_effect_sem <- effect_sem / (effect_ratio * log(10))
+          
+          # Create background string
+          background_string <- paste0(background_row, collapse = "")
+          
+          # Create variant ID with X at the position being mutated
+          variant_genotype <- strsplit(wt_condition$genotype, "")[[1]]
+          variant_genotype[i] <- "X"
+          variant_id <- paste0(variant_genotype, collapse = "")
+          
+          results <- bind_rows(results, tibble(
+            position = pos_name,
+            variant_id = variant_id,
+            background = background_string,
+            effect_ratio = effect_ratio,
+            effect_sd = effect_sd,
+            effect_sem = effect_sem,
+            log10_effect = log_effect,
+            log10_effect_sd = log_effect_sd,
+            log10_effect_sem = log_effect_sem,
+            wt_genotype = wt_condition$genotype,
+            mut_genotype = mut_condition$genotype,
+            wt_mean = wt_condition$mean_rate,
+            mut_mean = mut_condition$mean_rate,
+            wt_fold_vs_reference = wt_fold_change,
+            mut_fold_vs_reference = mut_fold_change,
+            wt_n = wt_condition$n_obs,
+            mut_n = mut_condition$n_obs
+          ))
+        }
+      }
+    }
+  }
+  
+  return(results)
+}
+```
+
+Also useful to get epistatic effects (EEs) across all backgrounds. Normalization to wt and log transform included here.
+
+Get it for Anc2 full
+
+```{r}
+anc2_smes <- calculate_single_mutational_effects(anc2)
+```
+
+Then Anc2 filtered for the m5 only
+
+```{r}
+anc2_partial <- anc2 %>% filter(p282 == 0, p297 == 0, p300 == 0)
+
+anc2_partial_smes <- calculate_single_mutational_effects(anc2_partial)
+```
+
+Then Anc2 filtered for the m5+i3 only
+
+```{r}
+anc2_partial_i3 <- anc2 %>% 
+  filter(p282 == 1, p297 == 1, p300 == 1) %>%
+  mutate(p282 = rep(0, 32), p297 = rep(0, 32), p300 = rep(0, 32))
+
+anc2_partial_i3_smes <- calculate_single_mutational_effects(anc2_partial_i3)
+```
+
+Then Anc5
+
+```{r}
+anc5_smes <- calculate_single_mutational_effects(anc5)
+```
+
+## Plotting
+
+All Anc2s
+
+```{r}
+position_summary <- anc2_smes %>%
+    mutate(position = factor(position, levels = c('p72', 'p193', 'p258', 'p271', 'p273', 'p282', 'p297', 'p300'))) %>%
+  group_by(position) %>%
+  summarise(log10_effect = mean(log10_effect))
+
+position_summary_2 <- anc2_smes %>%
+    mutate(position = factor(position, levels = c('p72', 'p193', 'p258', 'p271', 'p273', 'p282', 'p297', 'p300'))) %>%
+  group_by(position) %>%
+  mutate(additional_mut = str_count(background, '1')) %>%
+  filter(additional_mut == 0)
+
+anc2_smes %>%
+  mutate(position = factor(position, levels = c('p72', 'p193', 'p258', 'p271', 'p273', 'p282', 'p297', 'p300'))) %>%
+  ggplot(aes(x = position, y = log10_effect)) +
+  geom_hline(yintercept = 0, lty = 2) +
+  #geom_hline(yintercept = log10(3.4), lty = 2) +
+  #geom_hline(yintercept = log10(1/3.4), lty = 2) +
+  geom_jitter(width = 0.2, color = "lightblue") +
+  geom_point(data = position_summary, aes(y = log10_effect), 
+             color = "darkred", size = 2) +
+  geom_point(data = position_summary_2, aes(y = log10_effect), 
+             color = "black", size = 2) +
+  labs(x = "Position",
+       y = "log10 fold-change") +
+  ylim(c(-4, 4)) +
+  theme_classic()
+```
+
+Anc2 partial
+
+```{r}
+anc2_partial_smes %>%
+  mutate(position = factor(position, levels = c('p72', 'p193', 'p258', 'p271', 'p273', 'p282', 'p297', 'p300'))) %>%
+  ggplot(aes(x = position, y = log10_effect)) +
+  geom_hline(yintercept = 0) +
+  geom_hline(yintercept = log10(3.4), lty = 2) +
+  geom_hline(yintercept = log10(1/3.4), lty = 2) +
+  geom_jitter(width = 0.2, color = "lightblue") +
+  #geom_point(data = position_summary, aes(y = mean_effect), 
+  #           color = "darkred", size = 2) +
+  #geom_errorbar(aes(ymin = effect - effect_sd,
+  #                  ymax = effect + effect_sd),
+  #              color = "red", width = 0.2) +
+  labs(x = "Position",
+       y = "log10 fold-change") +
+  ylim(c(-3, 3)) +
+  theme_classic()
+```
+
+Anc5
+
+```{r}
+anc5_smes %>%
+  mutate(position = factor(position, levels = c('p72', 'p193', 'p258', 'p271', 'p273', 'p282', 'p297', 'p300'))) %>%
+  ggplot(aes(x = position, y = log10_effect)) +
+  geom_hline(yintercept = 0) +
+  geom_hline(yintercept = log10(3.4), lty = 2) +
+  geom_hline(yintercept = log10(1/3.4), lty = 2) +
+  geom_jitter(width = 0.2, color = "lightblue") +
+  #geom_point(data = position_summary, aes(y = mean_effect), 
+  #           color = "darkred", size = 2) +
+  #geom_errorbar(aes(ymin = effect - effect_sd,
+  #                  ymax = effect + effect_sd),
+  #              color = "red", width = 0.2) +
+  labs(x = "Position",
+       y = "log10 fold-change") +
+  ylim(c(-3, 3)) +
+  theme_classic()
+```
+
+Anc2+i3
+
+```{r}
+anc2_partial_i3_smes %>%
+  mutate(position = factor(position, levels = c('p72', 'p193', 'p258', 'p271', 'p273', 'p282', 'p297', 'p300'))) %>%
+  ggplot(aes(x = position, y = log10_effect)) +
+  geom_hline(yintercept = 0) +
+  geom_hline(yintercept = log10(3.4), lty = 2) +
+  geom_hline(yintercept = log10(1/3.4), lty = 2) +
+  geom_jitter(width = 0.2, color = "lightblue") +
+  #geom_point(data = position_summary, aes(y = mean_effect), 
+  #           color = "darkred", size = 2) +
+  #geom_errorbar(aes(ymin = effect - effect_sd,
+  #                  ymax = effect + effect_sd),
+  #              color = "red", width = 0.2) +
+  labs(x = "Position",
+       y = "log10 fold-change") +
+  ylim(c(-3, 3)) +
+  theme_classic()
+```
+
+Combined Anc2 and Anc5
+
+```{r}
+# Combine the datasets with ancestry labels
+anc2_labeled <- anc2_partial_smes %>% mutate(ancestry = "anc2")
+anc5_labeled <- anc5_smes %>% mutate(ancestry = "anc5")
+
+combined_effects <- bind_rows(anc2_labeled, anc5_labeled)
+```
+
+With lines connecting
+
+```{r}
+# Create manual x-position adjustments
+dodge_width <- 0.3
+combined_effects <- combined_effects %>%
+  mutate(
+    position = factor(position, levels = c('p72', 'p193', 'p258', 'p271', 'p273')),
+    position_numeric = as.numeric(position),
+    x_position = case_when(
+      ancestry == "anc2" ~ position_numeric - dodge_width/2,
+      ancestry == "anc5" ~ position_numeric + dodge_width/2
+    )
+  )
+
+# Create the plot with manual positioning
+p <- combined_effects %>%
+  mutate(ancestry = case_when(ancestry == "anc2" ~ "AncDHCH2",
+                              ancestry == "anc5" ~ "AncDHCH5")) %>%
+  ggplot(aes(x = x_position, y = log10_effect, color = ancestry)) +
+  # Add horizontal line at y = 0 (no effect) and thresholds (currently hardcoded)
+  geom_hline(yintercept = 0, alpha = 0.5) +
+  geom_hline(yintercept = log10(2), linetype = "dashed", alpha = 0.5) +
+  geom_hline(yintercept = log10(1/2), linetype = "dashed", alpha = 0.5) +
+  # Add connecting lines between anc2 and anc5 for the same variant_id
+  geom_line(aes(group = variant_id), 
+            color = "black", linewidth = 0.3) +
+  # Add points
+  geom_point(size = 1.5, alpha = 0.7) +
+  # Add error bars
+  geom_errorbar(aes(ymin = log10_effect - log10_effect_sem, 
+                    ymax = log10_effect + log10_effect_sem),
+                width = 0.05) +
+  # Customize colors
+  scale_color_manual(values = c("AncDHCH2" = "#E31A1C", "AncDHCH5" = "#1F78B4")) +
+  # Set x-axis to show position names
+  scale_x_continuous(
+    breaks = 1:length(unique(combined_effects$position)),
+    labels = unique(combined_effects$position)[order(unique(combined_effects$position))]
+  ) +
+  # Labels and theme
+  labs(
+    x = "Position",
+    y = expression('log'[10]*' SME (single mutational effect)'),
+    color = "Background",
+  ) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.title = element_text(size = 8),
+    panel.grid.minor = element_blank()
+  )
+
+p
+
+# With legend
+ggsave("anc2_vs_anc5_smes_leg.svg", p, width = 180/2, height = 247/4.2, dpi = 600, units = "mm")
+
+# Without legend
+ggsave("anc2_vs_anc5_smes.svg", p+theme(legend.position = "none"), width = 180/2, height = 247/4.2, dpi = 600, units = "mm")
+
+write_csv(combined_effects %>%
+  mutate(ancestry = case_when(ancestry == "anc2" ~ "AncDHCH2",
+                              ancestry == "anc5" ~ "AncDHCH5")), "smes_anc2_anc5.csv")
+```
+
+Combined Anc2+i3 and Anc5
+
+```{r}
+# Combine the datasets with ancestry labels
+anc2_i3_labeled <- anc2_partial_i3_smes %>% mutate(ancestry = "anc2+i3")
+
+combined_effects_2 <- bind_rows(anc2_i3_labeled, anc5_labeled)
+```
+
+With lines connecting
+
+```{r}
+# Create manual x-position adjustments
+combined_effects_2 <- combined_effects_2 %>%
+  mutate(
+    position = factor(position, levels = c('p72', 'p193', 'p258', 'p271', 'p273')),
+    position_numeric = as.numeric(position),
+    x_position = case_when(
+      ancestry == "anc2+i3" ~ position_numeric - dodge_width/2,
+      ancestry == "anc5" ~ position_numeric + dodge_width/2
+    )
+  )
+
+# Create the plot with manual positioning
+p_2 <- combined_effects_2 %>%
+  ggplot(aes(x = x_position, y = log10_effect, color = ancestry)) +
+  # Add horizontal line at y = 0 (no effect) and thresholds (currently hardcoded)
+  geom_hline(yintercept = 0, alpha = 0.5) +
+  geom_hline(yintercept = log10(2), linetype = "dashed", alpha = 0.5) +
+  geom_hline(yintercept = log10(1/2), linetype = "dashed", alpha = 0.5) +
+  # Add connecting lines between anc2 and anc5 for the same variant_id
+  geom_line(aes(group = variant_id), 
+            color = "black", linewidth = 0.3) +
+  # Add points
+  geom_point(size = 2, alpha = 0.7) +
+  # Add error bars
+  geom_errorbar(aes(ymin = log10_effect - log10_effect_sem, 
+                    ymax = log10_effect + log10_effect_sem),
+                width = 0.05) +
+  # Customize colors
+  scale_color_manual(values = c("anc2+i3" = "#E31A1C", "anc5" = "#1F78B4")) +
+  # Set x-axis to show position names
+  scale_x_continuous(
+    breaks = 1:length(unique(combined_effects$position)),
+    labels = unique(combined_effects$position)[order(unique(combined_effects$position))]
+  ) +
+  # Labels and theme
+  labs(
+    x = "Position",
+    y = expression('log'[10]*' SME (single mutational effect)'),
+    color = "Ancestry",
+  ) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+
+p_2
+
+ggsave("anc2_i3_vs_anc5_smes.svg", p_2, width = 180, height = 247/3, dpi = 300, units = "mm")
+```
+
+Combined Anc2 and Anc2+i3
+
+```{r}
+# Combine the datasets with ancestry labels
+combined_effects_3 <- bind_rows(anc2_labeled, anc2_i3_labeled)
+```
+
+With lines connecting
+
+```{r}
+# Create manual x-position adjustments
+combined_effects_3 <- combined_effects_3 %>%
+  mutate(
+    position = factor(position, levels = c('p72', 'p193', 'p258', 'p271', 'p273')),
+    position_numeric = as.numeric(position),
+    x_position = case_when(
+      ancestry == "anc2" ~ position_numeric - dodge_width/2,
+      ancestry == "anc2+i3" ~ position_numeric + dodge_width/2
+    )
+  )
+
+# Create the plot with manual positioning
+p_3 <- combined_effects_3 %>%
+  ggplot(aes(x = x_position, y = log10_effect, color = ancestry)) +
+  # Add horizontal line at y = 0 (no effect) and thresholds (currently hardcoded)
+  geom_hline(yintercept = 0, alpha = 0.5) +
+  geom_hline(yintercept = log10(2), linetype = "dashed", alpha = 0.5) +
+  geom_hline(yintercept = log10(1/2), linetype = "dashed", alpha = 0.5) +
+  # Add connecting lines between anc2 and anc5 for the same variant_id
+  geom_line(aes(group = variant_id), 
+            color = "black", linewidth = 0.3) +
+  # Add points
+  geom_point(size = 2, alpha = 0.7) +
+  # Add error bars
+  geom_errorbar(aes(ymin = log10_effect - log10_effect_sem, 
+                    ymax = log10_effect + log10_effect_sem),
+                width = 0.05) +
+  # Customize colors
+  scale_color_manual(values = c("anc2" = "#E31A1C", "anc2+i3" = "#1F78B4")) +
+  # Set x-axis to show position names
+  scale_x_continuous(
+    breaks = 1:length(unique(combined_effects$position)),
+    labels = unique(combined_effects$position)[order(unique(combined_effects$position))]
+  ) +
+  # Labels and theme
+  labs(
+    x = "Position",
+    y = expression('log'[10]*' SME (single mutational effect)'),
+    color = "Ancestry",
+  ) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+
+p_3
+
+#ggsave("anc2_vs_anc2_i3s_smes.svg", p_3, width = 180, height = 247/3, dpi = 300, units = "mm")
+```
+
+Also just the 282/300 combo with AncDHCH5
+
+```{r}
+anc2_partial_two_i3 <- anc2 %>% 
+  filter(p282 == 1, p297 == 0, p300 == 1) %>%
+  mutate(p282 = rep(0, 32), p297 = rep(0, 32), p300 = rep(0, 32))
+
+anc2_partial_two_i3 <- calculate_single_mutational_effects(anc2_partial_two_i3)
+
+anc2_two_i3_labeled <- anc2_partial_two_i3 %>% mutate(ancestry = "anc2+282/300")
+
+combined_effects_4 <- bind_rows(anc2_two_i3_labeled, anc5_labeled)
+```
+
+With lines connecting
+
+```{r}
+# Create manual x-position adjustments
+dodge_width <- 0.3
+combined_effects_4 <- combined_effects_4 %>%
+  mutate(
+    position = factor(position, levels = c('p72', 'p193', 'p258', 'p271', 'p273')),
+    position_numeric = as.numeric(position),
+    x_position = case_when(
+      ancestry == "anc2+282/300" ~ position_numeric - dodge_width/2,
+      ancestry == "anc5" ~ position_numeric + dodge_width/2
+    )
+  )
+
+# Create the plot with manual positioning
+p <- combined_effects_4 %>%
+  mutate(ancestry = case_when(ancestry == "anc2+282/300" ~ "AncDHCH2+282|300",
+                              ancestry == "anc5" ~ "AncDHCH5")) %>%
+  ggplot(aes(x = x_position, y = log10_effect, color = ancestry)) +
+  # Add horizontal line at y = 0 (no effect) and thresholds (currently hardcoded)
+  geom_hline(yintercept = 0, alpha = 0.5) +
+  geom_hline(yintercept = log10(2), linetype = "dashed", alpha = 0.5) +
+  geom_hline(yintercept = log10(1/2), linetype = "dashed", alpha = 0.5) +
+  # Add connecting lines between anc2 and anc5 for the same variant_id
+  geom_line(aes(group = variant_id), 
+            color = "black", linewidth = 0.3) +
+  # Add points
+  geom_point(size = 1.5, alpha = 0.7) +
+  # Add error bars
+  geom_errorbar(aes(ymin = log10_effect - log10_effect_sem, 
+                    ymax = log10_effect + log10_effect_sem),
+                width = 0.05) +
+  # Customize colors
+  scale_color_manual(values = c("AncDHCH2+282|300" = "#E31A1C", "AncDHCH5" = "#1F78B4")) +
+  # Set x-axis to show position names
+  scale_x_continuous(
+    breaks = 1:length(unique(combined_effects$position)),
+    labels = unique(combined_effects$position)[order(unique(combined_effects$position))]
+  ) +
+  # Labels and theme
+  labs(
+    x = "Position",
+    y = expression('log'[10]*' SME (single mutational effect)'),
+    color = "Background",
+  ) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.title = element_text(size = 8),
+    panel.grid.minor = element_blank()
+  )
+
+p
+
+# With legend
+ggsave("anc2_i2_vs_anc5_smes_leg.svg", p, width = 180/2.5, height = 247/4.2, dpi = 600, units = "mm")
+
+# Without legend
+ggsave("anc2_i2_vs_anc5_smes.svg", p+theme(legend.position = "none"), width = 180/2.5, height = 247/4.2, dpi = 600, units = "mm")
+
+write_csv(combined_effects_4 %>%
+  mutate(ancestry = case_when(ancestry == "anc2+282/300" ~ "AncDHCH2+282|300",
+                              ancestry == "anc5" ~ "AncDHCH5")), "smes_anc2_282_300_anc5.csv")
+```
+
+# Multisub inspired analysis
+
+Using some of the code from the multisubstrate analysis Rmd for PTE
+
+## Clean up
+
+Also adding Anc5 for later
+
+```{r}
+processed_anc2 <- anc2 %>%
+  pivot_longer(cols = exp1:exp23, names_to = 'replicate', values_to = 'activity', values_drop_na = TRUE) %>%
+  # "L∆HFIALA" is wt while "RSLLTPYV" is mutant
+  mutate(g72 = if_else(p72 == 0, "L", "R"),
+       g193 = if_else(p193 == 0, "∆", "S"),
+       g258 = if_else(p258 == 0, "H", "L"),
+       g271 = if_else(p271 == 0, "F", "L"),
+       g273 = if_else(p273 == 0, "I", "T"),
+       g282 = if_else(p282 == 0, "A", "P"),
+       g297 = if_else(p297 == 0, "L", "Y"),
+       g300 = if_else(p300 == 0, "A", "V")) %>%
+  unite("reference", g72:g300, na.rm = TRUE, remove = TRUE, sep = "")
+
+processed_anc5 <- anc5 %>%
+  pivot_longer(cols = exp1:exp6, names_to = 'replicate', values_to = 'activity', values_drop_na = TRUE) %>%
+  # "L∆HFIALA" is wt while "RSLLTPYV" is mutant
+  mutate(g72 = if_else(p72 == 0, "L", "R"),
+       g193 = if_else(p193 == 0, "∆", "S"),
+       g258 = if_else(p258 == 0, "H", "L"),
+       g271 = if_else(p271 == 0, "F", "L"),
+       g273 = if_else(p273 == 0, "I", "T"),
+       g282 = if_else(p282 == 1, "A", "P"),
+       g297 = if_else(p297 == 1, "L", "Y"),
+       g300 = if_else(p300 == 1, "A", "V")) %>%
+  unite("reference", g72:g300, na.rm = TRUE, remove = TRUE, sep = "")
+```
+
+```{r}
+mae_mean <- function(x) {
+  abs_devs = c()
+  for(i in 1:length(x)) {
+    abs_devs = c(abs(x - mean(x)), abs_devs)
+  }
+  return(mean(abs_devs))
+}
+
+mae_median <- function(x) {
+  abs_devs = c()
+  for(i in 1:length(x)) {
+    abs_devs = c(abs(x - median(x)), abs_devs)
+  }
+  return(median(abs_devs))
+}
+
+
+processed_mean_anc2 <- processed_anc2 %>%
+  group_by(p72, p193, p258, p271, p273, p282, p297, p300, reference) %>%
+  summarise(mean_activity = mean(activity),
+            sd_activity = sd(activity),
+            mae_mean_activity = mae_mean(activity),
+            mae_median_activity = mae_median(activity)) %>%
+  mutate(cv = sd_activity/mean_activity*100,
+         mean_fold_error = (mae_mean_activity/mean_activity) + 1,
+         median_absolute_deviation = mae_median_activity/mean_activity)
+
+processed_mean_anc5 <- processed_anc5 %>%
+  group_by(p72, p193, p258, p271, p273, p282, p297, p300, reference) %>%
+  summarise(mean_activity = mean(activity),
+            sd_activity = sd(activity),
+            mae_mean_activity = mae_mean(activity),
+            mae_median_activity = mae_median(activity)) %>%
+  mutate(cv = sd_activity/mean_activity*100,
+         mean_fold_error = (mae_mean_activity/mean_activity) + 1,
+         median_absolute_deviation = mae_median_activity/mean_activity)
+
+```
+
+We can then look at the distribution of coefficient of variation for each variant
+
+```{r}
+cv_fig <- processed_mean_anc2 %>%
+  ggplot(aes(x = cv)) +
+  geom_histogram(fill = golden) +
+  labs(x = "Coefficient of Variation (%)", y = "Genotypes") +
+  theme_classic()
+
+cv_fig
+```
+
+And mean average error
+
+```{r}
+mae_fig <- processed_mean_anc2 %>%
+  ggplot(aes(x = mean_fold_error)) +
+  geom_histogram(fill = golden) +
+  geom_vline(xintercept = 1.5, lty = 2) +
+  geom_vline(xintercept = 2, lty = 2, col = "darkred") +
+  labs(x = "Mean fold error (MAE)", y = "Genotypes") +
+  theme_classic()
+
+mae_fig
+```
+
+## Creating a normalized dataframe
+
+### Ensuring log-transformed data is normally distributed
+
+As the title says. To do this, it is worth collecting all the data, subtracting by the mean (to set the mean equal to 0) for each reference/substrate pair, then pooling all the data to verify that it is normally distributed (i.e. the errors on the log scale are normally distributed)
+
+```{r}
+norm_data <- processed_anc2 %>%
+  mutate(norm_activity = activity/mean(activity[reference == "L∆HFIALA"]), # Normalize by the mean activity of the wt sequence
+         norm_activity = log10(norm_activity)) %>% # Log-transform
+  ungroup() %>%
+  group_by(reference) %>%
+  mutate(norm_value = norm_activity - mean(norm_activity)) %>% # Set mean of each measurement to 0 
+  ungroup() 
+
+norm_fig <- norm_data %>%
+  ggplot(aes(x = norm_value)) +
+  geom_histogram(aes(y = after_stat(density)), binwidth = 0.01, color = "black", fill = golden, lwd = 0.2) +
+  stat_function(fun = dnorm, args = list(mean = mean(norm_data$norm_value), sd = sd(norm_data$norm_value)), colour = "black") +
+  theme_classic()
+
+norm_fig
+
+##ggsave("norm_fig.svg", plot = norm_fig, width = 180, height = 247/3, dpi = 300, units = "mm")
+```
+
+And the qqplot
+
+```{r}
+qqnorm(norm_data$norm_value, pch = 1, frame = FALSE)
+qqline(norm_data$norm_value, col = "steelblue", lwd = 2)
+```
+
+### Creating a data frame with statistics
+
+It may be useful to have a data frame that describes all of the general statistics. Since we've tested for normality, it is fair to get a mean and SD directly from the log-transformed data. **Note:** when you use these values to convert back to a fold-change scale, you will obtain a geometric mean of the fold-change. This is probably fair as "fold-change errors" are likely log-normal, this GM and GMSD are better metrics for those.
+
+```{r normalizing-no-norm-mae-hist}
+normalized_bulky_mean_data <- processed_anc2 %>%
+  mutate(norm_activity = log10(activity), # Log-transform
+         norm_activity = norm_activity - mean(norm_activity[reference == "L∆HFIALA"])) %>% # Normalize by the mean activity of the wt sequence
+  ungroup() %>%
+  select(-c("replicate", "activity")) %>%
+  group_by(p72, p193, p258, p271, p273, p282, p297, p300, reference) %>%
+  # Error propagation - http://surl.li/qrptg
+  summarize(mean_value = mean(norm_activity),
+         sd_value = sd(norm_activity),
+         total_entries = n()) %>%
+  mutate(se_value = sd_value / sqrt(total_entries) ) %>% ## THIS WAS NOT SQUARE ROOT PREVIOUSLY, FIXED
+  ungroup()
+
+normalized_bulky_mean_data_anc5 <- processed_anc5 %>%
+  mutate(norm_activity = log10(activity), # Log-transform
+         norm_activity = norm_activity - mean(norm_activity[reference == "L∆HFIALA"])) %>% # Normalize by the mean activity of the wt sequence
+  ungroup() %>%
+  select(-c("replicate", "activity")) %>%
+  group_by(p72, p193, p258, p271, p273, p282, p297, p300, reference) %>%
+  # Error propagation - http://surl.li/qrptg
+  summarize(mean_value = mean(norm_activity),
+         sd_value = sd(norm_activity),
+         total_entries = n()) %>%
+  mutate(se_value = sd_value / sqrt(total_entries)) %>%
+  ungroup()
+```
+
+## Epistasis tests
+
+### Generating SMEs and EEs
+
+```{r}
+## Helper functions 
+
+error_prop <- function(x){
+  return(sqrt(sum(x**2)))
+}
+
+harm_mean <- function(x){
+  return(length(x)/sum(1/x))
+}
+
+alternate_sub_add <- function(x){
+  # Takes the last term and alternates between subtracting and adding the next term to the left
+  y = x[length(x)]
+  counter = T
+  if(length(x) > 1) {
+    for(i in (length(x)-1):1){
+      if(counter){
+        y = y - x[i]
+        counter = F
+      } else{
+        y = y + x[i]
+        counter = T
+      }
+    }
+  }
+  return(y)
+}
+
+# Generate all possible combinations of numbers 1 to 8
+all_combinations <- lapply(1:8, function(x) combn(1:8, x, simplify = FALSE))
+
+# Combine all combinations into a single list
+combined_combinations <- unlist(all_combinations, recursive = FALSE)
+
+# Add the combination with all numbers
+combined_combinations <- c(combined_combinations, list(1:8))
+
+###
+
+ees = data.frame()
+
+for(combo in 1:length(combined_combinations)) {
+  if(combo != length(combined_combinations)) {
+    temp_small_data_ready <- normalized_bulky_mean_data %>%
+    rowwise() %>%
+    mutate(muts = sum(p72, p193, p258, p271, p273, p282, p297, p300)) %>%
+    ungroup() %>%
+    filter_at(vars(combined_combinations[[combo]]), all_vars(. != 1)) %>%
+    group_by(muts)
+  } else {
+    temp_small_data_ready <- normalized_bulky_mean_data %>%
+    rowwise() %>%
+    mutate(muts = sum(p72, p193, p258, p271, p273, p282, p297, p300)) %>%
+    ungroup() %>%
+    group_by(muts)
+  }
+
+  
+  cur_harm_mean <- temp_small_data_ready %>% pull(total_entries) %>% harm_mean() # Get harmonic mean
+  
+  # Calculate epistasis with error propagation
+  next_term <- temp_small_data_ready %>%
+    summarize(new_val = sum(mean_value), ## Should I check this process?
+              new_se = error_prop(se_value)) %>%
+    ungroup() %>%
+    summarize(new_val = alternate_sub_add(new_val),
+              new_se = error_prop(new_se)) %>%
+    mutate(new_n = cur_harm_mean)
+  
+  ref_geno = "00000000"
+  current = unique(which(!(seq(1, 8, 1) %in% combined_combinations[[combo]])))
+  if(length(current) > 0){
+    for(number in 1:length(current)){
+      substr(ref_geno, current[number], current[number]) <- 'x'
+    }
+  } else {
+    ref_geno = "xxxxxxxx"
+  }
+  
+  ees = rbind(ees, next_term %>% mutate(geno = ref_geno))
+}
+
+ees <- ees %>% distinct() # Remove duplicates
+
+# Remove artifactual second to last order row
+ees <- ees %>% 
+  slice(- (n() - 1))
+```
+
+### Significance testing of EEs
+
+Next comes significance testing. Thanks to Dan for the code to perform the adjusted p-value.
+
+```{r ee-sig-test}
+## SOME NA VALUES? WHY? Probably because I am missing replicates for certain genotypes
+test_ees <- ees %>%
+  mutate(t = (new_val)/new_se,
+         p = 2*pt(abs(t),df=new_n-1,lower=F)) %>%
+  mutate(padj = p.adjust(p,method = 'fdr'),n=nrow(.),
+         muts = str_count(geno, 'x'),
+         sig = padj < 0.01)
+```
+
+Finally we can visualize this in volcano plots to look at EEs (x-axis) vs significance (y-axis):
+
+```{r}
+volcano_fig <- test_ees %>%
+  filter(muts > 1) %>%
+  mutate(muts = factor(muts)) %>%
+  ggplot(aes(x = new_val, y = -1*log10(padj), color = muts)) +
+  geom_hline(yintercept = -log10(0.01), lty = 2) +
+  geom_vline(xintercept = 0, lty = 2) +
+  geom_point() +
+  #xlim(-2.5, 2.5) +
+  labs(x = "log10 Epistatic Coefficient", 
+       y = expression("-log"[10]*" p-value"),
+       color = "Mutations") +
+  theme_classic()
+
+volcano_fig
+
+##ggsave("volcano_fig.svg", plot = volcano_fig, width = 180, height = 247/2, dpi = 300, units = "mm")
+
+```
+
+First it is worth verifying single mutational effects look the same as previous analysis
+
+```{r}
+sme_sub_fig <- test_ees %>%
+  filter(muts == 1) %>%
+  mutate(muts = as.factor(muts)) %>%
+  ggplot(aes(x = muts, y = new_val, col = sig)) +
+  geom_point() +
+  geom_errorbar(aes(ymin=new_val-new_se, ymax=new_val+new_se), 
+                width=.05, 
+                position=position_dodge(.9)) +
+  geom_hline(yintercept = 0, lty = 2) +
+  facet_wrap(~geno) +
+  theme_classic() +
+  labs(x = "Mutations", y = "Epistasis") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+sme_sub_fig
+
+##ggsave("sme_sub_fig.svg", plot = sme_sub_fig, width = 180, height = 247/2, dpi = 300, units = "mm")
+```
+
+And second
+
+```{r coef-by-sub-2nd}
+ee2_sub_fig <- test_ees %>%
+  filter(muts == 2) %>%
+  mutate(muts = as.factor(muts)) %>%
+  ggplot(aes(x = muts, y = new_val, col = sig)) +
+  geom_point() +
+  geom_errorbar(aes(ymin=new_val-new_se, ymax=new_val+new_se), 
+                width=.05, 
+                position=position_dodge(.9)) +
+  geom_hline(yintercept = 0, lty = 2) +
+  facet_wrap(~geno) +
+  theme_classic() +
+  labs(x = "Mutations", y = "Epistasis") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ee2_sub_fig
+
+##ggsave("ee2_sub_figb_fig.svg", plot = ee2_sub_fig, width = 180, height = 247/2, dpi = 300, units = "mm")
+```
+
+And third
+
+```{r coef-by-sub-3rd}
+ee2_sub_fig <- test_ees %>%
+  filter(muts == 3) %>%
+  mutate(muts = as.factor(muts)) %>%
+  ggplot(aes(x = muts, y = new_val, col = sig)) +
+  geom_point() +
+  geom_errorbar(aes(ymin=new_val-new_se, ymax=new_val+new_se), 
+                width=.05, 
+                position=position_dodge(.9)) +
+  geom_hline(yintercept = 0, lty = 2) +
+  facet_wrap(~geno) +
+  theme_classic() +
+  labs(x = "Mutations", y = "Epistasis") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ee2_sub_fig
+
+##ggsave("ee3_sub_figb_fig.svg", plot = ee3_sub_fig, width = 180, height = 247/2, dpi = 300, units = "mm")
+```
+
+## i3 on m5 modulation
+
+Here I run significance testing on subsets of the data, starting with 282 mutated
+
+```{r}
+
+get_ees_subset <- function(current_data, m282, m297, m300, type) {
+  normalized_bulky_mean_data_temp <- current_data %>%
+  filter(p282 == m282, p297 == m297, p300 == m300)
+
+  wt_ref <- (normalized_bulky_mean_data_temp %>% filter(p72 == 0, p193 == 0, p258 == 0, p271 == 0, p273 == 0))$reference[1]
+  
+  normalized_bulky_mean_data_temp <- normalized_bulky_mean_data_temp %>%
+    mutate(norm_activity = log10(activity), # Log-transform
+           norm_activity = norm_activity - mean(norm_activity[reference == wt_ref])) %>% # Normalize by the mean activity of the wt sequence
+    ungroup() %>%
+    select(-c("replicate", "activity")) %>%
+    group_by(p72, p193, p258, p271, p273, reference) %>%
+    # Error propagation - http://surl.li/qrptg
+    summarize(mean_value = mean(norm_activity),
+           sd_value = sd(norm_activity),
+           total_entries = n()) %>%
+    mutate(se_value = sd_value / sqrt(total_entries)) %>%
+    ungroup()
+  
+  all_combinations <- lapply(1:5, function(x) combn(1:5, x, simplify = FALSE))
+  
+  # Combine all combinations into a single list
+  combined_combinations <- unlist(all_combinations, recursive = FALSE)
+  
+  # Add the combination with all numbers
+  combined_combinations <- c(combined_combinations, list(1:5))
+  
+  ###
+  
+  ees = data.frame()
+  
+  for(combo in 1:length(combined_combinations)) {
+    if(combo != length(combined_combinations)) {
+      temp_small_data_ready <- normalized_bulky_mean_data_temp %>%
+      rowwise() %>%
+      mutate(muts = sum(p72, p193, p258, p271, p273)) %>%
+      ungroup() %>%
+      filter_at(vars(combined_combinations[[combo]]), all_vars(. != 1)) %>%
+      group_by(muts)
+    } else {
+      temp_small_data_ready <- normalized_bulky_mean_data_temp %>%
+      rowwise() %>%
+      mutate(muts = sum(p72, p193, p258, p271, p273)) %>%
+      ungroup() %>%
+      group_by(muts)
+    }
+
+    cur_harm_mean <- temp_small_data_ready %>% pull(total_entries) %>% harm_mean() # Get harmonic mean
+    
+    # Calculate epistasis with error propagation
+    next_term <- temp_small_data_ready %>%
+      summarize(new_val = sum(mean_value),
+                new_se = error_prop(se_value)) %>%
+      ungroup() %>%
+      summarize(new_val = alternate_sub_add(new_val),
+                new_se = error_prop(new_se)) %>%
+      mutate(new_n = cur_harm_mean)
+    
+    ref_geno = "00000"
+    current = unique(which(!(seq(1, 5, 1) %in% combined_combinations[[combo]])))
+    if(length(current) > 0){
+      for(number in 1:length(current)){
+        substr(ref_geno, current[number], current[number]) <- 'x'
+      }
+    } else {
+      ref_geno = "xxxxx"
+    }
+    
+    ees = rbind(ees, next_term %>% mutate(geno = ref_geno))
+  }
+  
+  ees <- ees %>% distinct() # Remove duplicates
+  
+  # Remove artifactual second to last order row
+  ees <- ees %>% 
+    slice(- (n() - 1))
+  
+  test_ees <- ees %>%
+  mutate(t = (new_val)/new_se,
+         p= 2*pt(abs(t),df=new_n-1,lower=F)) %>%
+  mutate(padj = p.adjust(p,method = 'fdr'),n=nrow(.),
+         muts = str_count(geno, 'x'),
+         sig = padj < 0.05,
+         type = type)
+  
+  return(test_ees)
+}
+
+ees_wt <- get_ees_subset(processed_anc2, 0, 0, 0, 'wt')
+ees_282 <- get_ees_subset(processed_anc2, 1, 0, 0, '282')
+ees_297 <- get_ees_subset(processed_anc2, 0, 1, 0, '297')
+ees_300 <- get_ees_subset(processed_anc2, 0, 0, 1, '300')
+ees_282_297 <- get_ees_subset(processed_anc2, 1, 1, 0, '282|297')
+ees_282_300 <- get_ees_subset(processed_anc2, 1, 0, 1, '282|300')
+ees_297_300 <- get_ees_subset(processed_anc2, 0, 1, 1, '297|300')
+ees_282_297_300 <- get_ees_subset(processed_anc2, 1, 1, 1, '282|297|300')
+ees_anc5 <- get_ees_subset(processed_anc5, 0, 0, 0, 'anc5')
+```
+
+Now I need to make a heat map where each column is each ees_set. First I need to move the last entry (xxxxx) to be the first entry, then flip the entire dataset, then take the new_val and sig
+
+```{r}
+ees_wt_moved <- ees_wt %>% 
+  slice(n(), 1:(n()-1)) %>%
+  arrange(desc(row_number())) %>%
+  select(c(new_val, geno, sig, type))
+
+ees_282_moved <- ees_282 %>% 
+  slice(n(), 1:(n()-1)) %>%
+  arrange(desc(row_number())) %>%
+  select(c(new_val, geno, sig, type))
+
+ees_297_moved <- ees_297 %>% 
+  slice(n(), 1:(n()-1)) %>%
+  arrange(desc(row_number())) %>%
+  select(c(new_val, geno, sig, type))
+
+ees_300_moved <- ees_300 %>% 
+  slice(n(), 1:(n()-1)) %>%
+  arrange(desc(row_number())) %>%
+  select(c(new_val, geno, sig, type))
+
+ees_282_297_moved <- ees_282_297 %>% 
+  slice(n(), 1:(n()-1)) %>%
+  arrange(desc(row_number())) %>%
+  select(c(new_val, geno, sig, type))
+
+ees_282_300_moved <- ees_282_300 %>% 
+  slice(n(), 1:(n()-1)) %>%
+  arrange(desc(row_number())) %>%
+  select(c(new_val, geno, sig, type))
+
+ees_297_300_moved <- ees_297_300 %>% 
+  slice(n(), 1:(n()-1)) %>%
+  arrange(desc(row_number())) %>%
+  select(c(new_val, geno, sig, type))
+
+ees_282_297_300_moved <- ees_282_297_300 %>% 
+  slice(n(), 1:(n()-1)) %>%
+  arrange(desc(row_number())) %>%
+  select(c(new_val, geno, sig, type))
+
+ees_anc5_moved <- ees_anc5 %>% 
+  slice(n(), 1:(n()-1)) %>%
+  arrange(desc(row_number())) %>%
+  select(c(new_val, geno, sig, type))
+```
+
+Then visualize
+
+```{r}
+ees_combined <- bind_rows(list(ees_wt_moved, 
+                               ees_282_moved, 
+                               ees_297_moved, 
+                               ees_300_moved, 
+                               ees_282_297_moved,
+                               ees_282_300_moved,
+                               ees_297_300_moved,
+                               ees_282_297_300_moved,
+                               ees_anc5))
+                      
+# 2. Plotting
+ees_combined %>%
+  mutate(sig = case_when(is.na(sig) ~ FALSE,
+                         TRUE ~ sig),
+         geno = fct_inorder(geno),
+         type = fct_inorder(type)) %>%
+  ggplot(aes(x = type, y = geno, fill = new_val)) +
+  # Use 'color' for the border and 'linewidth' to make it stand out
+  geom_tile(aes(color = sig), width = 0.9, height = 0.9, linewidth = 0.3) +
+  # Blue-to-Red gradient
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", 
+                       midpoint = mean(ees_combined$new_val, na.rm = TRUE)) +
+  # Define border colors: e.g., black for TRUE, transparent or light grey for FALSE
+  scale_color_manual(values = c("TRUE" = "black", "FALSE" = "transparent")) +
+  theme_minimal() +
+  theme(
+    # Tilt x-axis labels 45 degrees
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    panel.grid = element_blank()
+  ) +
+  labs(fill = "Value", color = "Significant") +
+  coord_fixed() # Keeps tiles square
+```
+
+Then different view
+
+```{r}
+ees_combined_for_plot <- ees_combined %>%
+  mutate(type = case_when(type == "wt" ~ "AncDHCH2",
+                          type == "282" ~ "+282",
+                          type == "297" ~ "+297",
+                          type == "300" ~ "+300",
+                          type == "282|297" ~ "+282|297",
+                          type == "282|300" ~ "+282|300",
+                          type == "297|300" ~ "+297|300",
+                          type == "282|297|300" ~ "+282|297|300",
+                          type == "anc5" ~ "AncDHCH5")) %>%
+  mutate(
+    sig = ifelse(is.na(sig), FALSE, sig),
+    geno = fct_reorder(geno, muts, .na_rm = TRUE), # THIS MIGHT BE WRONG, CHECK IF NEEDED
+    type = fct_rev(fct_inorder(type)) # Reversed so AncDHCH2 is on top if desired
+  )
+
+tile_2 <- ees_combined_for_plot %>%
+  ggplot(aes(x = geno, y = type, fill = new_val)) +
+  # Black border for significance, light grey for others to match the screenshot "grid" look
+  geom_tile(aes(color = sig), width = 0.9, height = 0.9, linewidth = 0.3) +
+  # Moving X axis to the top
+  scale_x_discrete(position = "top") +
+  scale_fill_gradient2(
+    low = "#1F78B4", mid = "white", high = "#E31A1C",
+    midpoint = mean(ees_combined$new_val, na.rm = TRUE)
+  ) +
+  scale_color_manual(values = c("TRUE" = "black", "FALSE" = "grey90")) +
+  theme_minimal() +
+  theme(
+    # 45 degree tilt, adjusted for top position
+    axis.text.x.top = element_text(angle = 45, hjust = 0, vjust = 0, size = 8),
+    axis.title.y = element_blank(),
+    axis.text.y = element_text(size = 8),
+    panel.grid = element_blank(),
+    legend.position = "right",
+    legend.text = element_text(size = 8)
+  ) +
+  labs(x = "Genotype", 
+       fill = "Epistatic effect (EE)") +
+  coord_fixed()
+
+tile_2
+
+# Clean figure
+ggsave("fig_4_e.svg", plot = tile_2 + theme(legend.position = "none"), width = 180/1.2, height = 247/4, dpi = 600, units = "mm")
+# With legend for reference
+ggsave("fig_4_e_legend.svg", plot = tile_2, width = 180/1.2, height = 247/4, dpi = 600, units = "mm")
+
+write_csv(ees_combined_for_plot, "all_smes_and_ees.csv")
+
+```
+
+It appears that the i3s are doing a few subtle things:
+1) Disrupting SME of 193, 258, and 271... This becomes primarily apparent in 282|300 and 282|297|300
+2) They are amplifying the negative pairwise EEs of the m5 (x000x, 00x0x)
+3) Less significant positive epistasis in the 3rd order
+
+Note these are patterns of epistasis, not phenotypes. These are normalized to their respective WT and the i3s show subtle changes to "wt" activity.
+
+## Heat map for landscapes
+
+```{r}
+combo_data <- rbind(processed_anc2 
+                    %>% mutate(type = case_when(p282 == 0 & p297 == 0 & p300 == 0 ~ 'wt',
+                                                p282 == 1 & p297 == 0 & p300 == 0 ~ '282',
+                                                p282 == 0 & p297 == 1 & p300 == 0 ~ '297',
+                                                p282 == 0 & p297 == 0 & p300 == 1 ~ '300',
+                                                p282 == 1 & p297 == 1 & p300 == 0 ~ '282|297',
+                                                p282 == 1 & p297 == 0 & p300 == 1 ~ '282|300',
+                                                p282 == 0 & p297 == 1 & p300 == 1 ~ '297|300',
+                                                p282 == 1 & p297 == 1 & p300 == 1 ~ '282|297|300',
+                                                .default = 'ok')),
+      processed_anc5 %>% mutate(type = "anc5"))
+
+combo_data_processed <- combo_data %>% 
+  select(-c(p282, p297, p300)) %>%
+  mutate(type = fct_inorder(type),
+         geno = paste0(p72, p193, p258, p271, p273),
+         geno = fct_inorder(geno),
+         norm_activity = log10(activity), # Log-transform
+         norm_activity = norm_activity - mean(norm_activity[reference == 'L∆HFIALA' & type == 'wt'])
+         # Normalize by the mean activity of the wt sequence
+         ) %>% 
+  ungroup() %>%
+  select(-c("replicate", "activity")) %>%
+  group_by(geno, type) %>%
+  summarise(mean_activity = mean(norm_activity))
+  
+```
+
+Then plot a similar heat map
+
+```{r}
+combo_data_processed %>%
+  ggplot(aes(x = type, y = geno, fill = mean_activity)) +
+  # Use 'color' for the border and 'linewidth' to make it stand out
+  geom_tile(width = 0.9, height = 0.9, linewidth = 0.3) +
+  # Blue-to-Red gradient
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", 
+                       midpoint = 0) +
+  theme_minimal() +
+  theme(
+    # Tilt x-axis labels 45 degrees
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    panel.grid = element_blank()
+  ) +
+  labs(fill = "Value", color = "Significant") +
+  coord_fixed() # Keeps tiles square
+```
+
+Also figure grade layout
+
+```{r}
+combo_data_processed_for_plot <- combo_data_processed %>%
+  mutate(type = case_when(type == "wt" ~ "AncDHCH2",
+                          type == "282" ~ "+282",
+                          type == "297" ~ "+297",
+                          type == "300" ~ "+300",
+                          type == "282|297" ~ "+282|297",
+                          type == "282|300" ~ "+282|300",
+                          type == "297|300" ~ "+297|300",
+                          type == "282|297|300" ~ "+282|297|300",
+                          type == "anc5" ~ "AncDHCH5")) %>%
+  mutate(
+    geno = fct_inorder(geno),
+    type = fct_rev(fct_inorder(type)) # Reversed so AncDHCH2 is on top if desired
+  )
+
+tile <- combo_data_processed_for_plot %>%
+  ggplot(aes(x = geno, y = type, fill = mean_activity)) +
+  # Black border for significance, light grey for others to match the screenshot "grid" look
+  geom_tile(color = "black", linewidth = 0.1) +
+  # Moving X axis to the top
+  scale_x_discrete(position = "top") +
+  scale_fill_gradient2(
+    low = "#1F78B4", mid = "white", high = "#E31A1C", 
+    midpoint = 0
+  ) +
+  theme_minimal() +
+  theme(
+    # 45 degree tilt, adjusted for top position
+    axis.text.x.top = element_text(angle = 45, hjust = 0, vjust = 0, size = 8),
+    axis.title.y = element_blank(),
+    axis.text.y = element_text(size = 8),
+    axis.title.x.top = element_text(size = 8),
+    panel.grid = element_blank(),
+    legend.position = "right",
+    legend.text = element_text(size = 8)
+  ) +
+  labs(x = "Genotype", 
+       fill = expression("log"[10]*" fold change in activity")) +
+  coord_fixed()
+
+tile
+
+# Clean figure
+ggsave("fig_4_a.svg", plot = tile + theme(legend.position = "none"), width = 180/1.2, height = 247/3, dpi = 600, units = "mm")
+# With legend for reference
+ggsave("fig_4_a_legend.svg", plot = tile, width = 180/1.2, height = 247/3, dpi = 600, units = "mm")
+
+write_csv(combo_data_processed_for_plot, "all_log10_fold_changes.csv")
+```
+
+Before moving to individual correlations I think a subset figure is useful for the manuscript
+
+```{r}
+tile <- combo_data_processed %>%
+  filter(type %in% c("wt", "anc5")) %>%
+  mutate(type = case_when(type == "wt" ~ "AncDHCH2",
+                          type == "anc5" ~ "AncDHCH5")) %>%
+  mutate(
+    geno = fct_inorder(geno),
+    type = fct_rev(fct_inorder(type)) # Reversed so AncDHCH2 is on top if desired
+  ) %>%
+  ggplot(aes(x = geno, y = type, fill = mean_activity)) +
+  # Black border for significance, light grey for others to match the screenshot "grid" look
+  geom_tile(color = "black", linewidth = 0.1) +
+  # Moving X axis to the top
+  scale_x_discrete(position = "top") +
+  scale_fill_gradient2(
+    low = "#1F78B4", mid = "white", high = "#E31A1C", 
+    midpoint = 0
+  ) +
+  theme_minimal() +
+  theme(
+    # 45 degree tilt, adjusted for top position
+    axis.text.x.top = element_text(angle = 45, hjust = 0, vjust = 0, size = 8),
+    axis.title.y = element_blank(),
+    axis.text.y = element_text(size = 8),
+    axis.title.x.top = element_text(size = 8),
+    panel.grid = element_blank(),
+    legend.position = "right",
+    legend.text = element_text(size = 8)
+  ) +
+  labs(x = "Genotype", 
+       fill = expression("log"[10]*" fold change in activity")) +
+  coord_fixed()
+
+
+
+tile
+
+# Clean figure
+ggsave("fig_2_a.svg", plot = tile + theme(legend.position = "none"), width = 180/1.2, height = 247/4, dpi = 600, units = "mm")
+# With legend for reference
+ggsave("fig_2_a_legend.svg", plot = tile, width = 180/1.2, height = 247/4, dpi = 600, units = "mm")
+
+```
+
+and epistatic effects
+
+```{r}
+tile_2 <- ees_combined %>%
+  filter(type %in% c("wt", "anc5")) %>%
+  mutate(type = case_when(type == "wt" ~ "AncDHCH2",
+                          type == "anc5" ~ "AncDHCH5")) %>%
+  mutate(
+    sig = ifelse(is.na(sig), FALSE, sig),
+    geno = fct_inorder(geno),
+    type = fct_rev(fct_inorder(type)) # Reversed so AncDHCH2 is on top if desired
+  ) %>%
+  ggplot(aes(x = geno, y = type, fill = new_val)) +
+  # Black border for significance, light grey for others to match the screenshot "grid" look
+  geom_tile(aes(color = sig), width = 0.9, height = 0.9, linewidth = 0.3) +
+  # Moving X axis to the top
+  scale_x_discrete(position = "top") +
+  scale_fill_gradient2(
+    low = "#1F78B4", mid = "white", high = "#E31A1C",
+    midpoint = mean(ees_combined$new_val, na.rm = TRUE)
+  ) +
+  scale_color_manual(values = c("TRUE" = "black", "FALSE" = "grey90")) +
+  theme_minimal() +
+  theme(
+    # 45 degree tilt, adjusted for top position
+    axis.text.x.top = element_text(angle = 45, hjust = 0, vjust = 0, size = 8),
+    axis.title.y = element_blank(),
+    axis.text.y = element_text(size = 8),
+    axis.title.x.top = element_text(size = 8),
+    panel.grid = element_blank(),
+    legend.position = "right",
+    legend.text = element_text(size = 8)
+  ) +
+  labs(x = "Genotype", 
+       fill = "Epistatic effect (EE)") +
+  coord_fixed()
+
+tile_2
+
+# Clean figure
+ggsave("fig_2_d.svg", plot = tile_2 + theme(legend.position = "none"), width = 180/1.2, height = 247/4, dpi = 600, units = "mm")
+# With legend for reference
+ggsave("fig_2_d_legend.svg", plot = tile_2, width = 180/1.2, height = 247/4, dpi = 600, units = "mm")
+
+```
+
+## Correlation to Anc5
+
+Correlate wt with each, then anc5 with each
+
+```{r}
+combo_data_processed %>% 
+  filter(type == 'wt' | type == '282') %>%
+  pivot_wider(names_from = type, values_from = mean_activity) %>%
+  ggplot(aes(x = wt, y = `282`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  xlim(-2,4) +
+  ylim(-2,4) +
+  stat_cor(label.y = 4, aes(label = after_stat(rr.label))) +
+  theme_classic()
+```
+
+```{r}
+combo_data_processed %>% 
+  filter(type == 'wt' | type == '297') %>%
+  pivot_wider(names_from = type, values_from = mean_activity) %>%
+  ggplot(aes(x = wt, y = `297`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  xlim(-2,4) +
+  ylim(-2,4) +
+  stat_cor(label.y = 4, aes(label = after_stat(rr.label))) +
+  theme_classic()
+```
+
+```{r}
+combo_data_processed %>% 
+  filter(type == 'wt' | type == '300') %>%
+  pivot_wider(names_from = type, values_from = mean_activity) %>%
+  ggplot(aes(x = wt, y = `300`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  xlim(-2,4) +
+  ylim(-2,4) +
+  stat_cor(label.y = 4, aes(label = after_stat(rr.label))) +
+  theme_classic()
+```
+
+```{r}
+combo_data_processed %>% 
+  filter(type == 'wt' | type == '282|297') %>%
+  pivot_wider(names_from = type, values_from = mean_activity) %>%
+  ggplot(aes(x = wt, y = `282|297`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  xlim(-2,4) +
+  ylim(-2,4) +
+  stat_cor(label.y = 4, aes(label = after_stat(rr.label))) +
+  theme_classic()
+```
+
+```{r}
+combo_data_processed %>% 
+  filter(type == 'wt' | type == '282|300') %>%
+  pivot_wider(names_from = type, values_from = mean_activity) %>%
+  ggplot(aes(x = wt, y = `282|300`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  xlim(-2,4) +
+  ylim(-2,4) +
+  stat_cor(label.y = 4, aes(label = after_stat(rr.label))) +
+  theme_classic()
+```
+
+```{r}
+combo_data_processed %>% 
+  filter(type == 'wt' | type == '297|300') %>%
+  pivot_wider(names_from = type, values_from = mean_activity) %>%
+  ggplot(aes(x = wt, y = `297|300`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  xlim(-2,4) +
+  ylim(-2,4) +
+  stat_cor(label.y = 4, aes(label = after_stat(rr.label))) +
+  theme_classic()
+```
+
+```{r}
+combo_data_processed %>% 
+  filter(type == 'wt' | type == '282|297|300') %>%
+  pivot_wider(names_from = type, values_from = mean_activity) %>%
+  ggplot(aes(x = wt, y = `282|297|300`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  xlim(-2,4) +
+  ylim(-2,4) +
+  stat_cor(label.y = 4, aes(label = after_stat(rr.label))) +
+  theme_classic()
+```
+
+```{r}
+combo_data_processed %>% 
+  filter(type == 'wt' | type == 'anc5') %>%
+  pivot_wider(names_from = type, values_from = mean_activity) %>%
+  ggplot(aes(x = `wt`, y = `anc5`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  xlim(-2,4) +
+  ylim(-2,4) +
+  stat_cor(label.y = 4, aes(label = after_stat(rr.label))) +
+  theme_classic()
+```
+
+```{r}
+combo_data_processed %>% 
+  filter(type == 'anc5' | type == '282') %>%
+  pivot_wider(names_from = type, values_from = mean_activity) %>%
+  ggplot(aes(x = `anc5`, y = `282`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  xlim(-2,4) +
+  ylim(-2,4) +
+  stat_cor(label.y = 4, aes(label = after_stat(rr.label))) +
+  theme_classic()
+```
+
+```{r}
+combo_data_processed %>% 
+  filter(type == 'anc5' | type == '297') %>%
+  pivot_wider(names_from = type, values_from = mean_activity) %>%
+  ggplot(aes(x = `anc5`, y = `297`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  xlim(-2,4) +
+  ylim(-2,4) +
+  stat_cor(label.y = 4, aes(label = after_stat(rr.label))) +
+  theme_classic()
+```
+
+```{r}
+combo_data_processed %>% 
+  filter(type == 'anc5' | type == '300') %>%
+  pivot_wider(names_from = type, values_from = mean_activity) %>%
+  ggplot(aes(x = `anc5`, y = `300`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  xlim(-2,4) +
+  ylim(-2,4) +
+  stat_cor(label.y = 4, aes(label = after_stat(rr.label))) +
+  theme_classic()
+```
+
+```{r}
+combo_data_processed %>% 
+  filter(type == 'anc5' | type == '282|297') %>%
+  pivot_wider(names_from = type, values_from = mean_activity) %>%
+  ggplot(aes(x = `anc5`, y = `282|297`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  xlim(-2,4) +
+  ylim(-2,4) +
+  stat_cor(label.y = 4, aes(label = after_stat(rr.label))) +
+  theme_classic()
+```
+
+```{r}
+two_enough <- combo_data_processed %>% 
+  filter(type == 'anc5' | type == '282|300') %>%
+  pivot_wider(names_from = type, values_from = mean_activity) %>%
+  ggplot(aes(x = `282|300`, y = `anc5`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "#E31A1C") +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  xlim(-2,2) +
+  ylim(-2,2) +
+  stat_cor(size = 2.8, label.y = 2, aes(label = after_stat(rr.label))) +
+  theme_classic() +
+  labs(y = expression("AncDHCH5 ∆log"[10]*" activity"),
+       x = expression("+282|300 ∆log"[10]*" activity")) +
+  theme(
+    axis.text.x = element_text(size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.title.x = element_text(size = 8),
+    axis.title.y = element_text(size = 8),
+    panel.grid.minor = element_blank()
+  )
+
+two_enough
+
+ggsave("282|300_vs_anc5.svg", plot = two_enough, width = 180/4, height = 247/4.4, dpi = 600, units = "mm")
+
+```
+
+```{r}
+combo_data_processed %>% 
+  filter(type == 'anc5' | type == '297|300') %>%
+  pivot_wider(names_from = type, values_from = mean_activity) %>%
+  ggplot(aes(x = `anc5`, y = `297|300`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  xlim(-2,4) +
+  ylim(-2,4) +
+  stat_cor(label.y = 4, aes(label = after_stat(rr.label))) +
+  theme_classic()
+```
+
+```{r}
+combo_data_processed %>% 
+  filter(type == 'anc5' | type == '282|297|300') %>%
+  pivot_wider(names_from = type, values_from = mean_activity) %>%
+  ggplot(aes(x = `anc5`, y = `282|297|300`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  xlim(-2,4) +
+  ylim(-2,4) +
+  stat_cor(label.y = 4, aes(label = after_stat(rr.label))) +
+  theme_classic()
+```
+
+Trying to align epistasis coefficients as well
+
+```{r}
+ees_combined %>%
+  filter(sig & (type == 'wt' | type == '282')) %>%
+  pivot_wider(names_from = type, values_from = new_val) %>%
+  ggplot(aes(x = wt, y = `282`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  xlim(-3,4) +
+  ylim(-3,4) +
+  stat_cor(label.y = 4, aes(label = after_stat(rr.label))) +
+  theme_classic()
+```
+
+```{r}
+ees_combined %>%
+  filter(sig & (type == 'wt' | type == '297')) %>%
+  pivot_wider(names_from = type, values_from = new_val) %>%
+  ggplot(aes(x = wt, y = `297`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  xlim(-3,4) +
+  ylim(-3,4) +
+  stat_cor(label.y = 4, aes(label = after_stat(rr.label))) +
+  theme_classic()
+```
+
+```{r}
+ees_combined %>%
+  filter(sig & (type == 'wt' | type == '300')) %>%
+  pivot_wider(names_from = type, values_from = new_val) %>%
+  ggplot(aes(x = wt, y = `300`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  xlim(-3,4) +
+  ylim(-3,4) +
+  stat_cor(label.y = 4, aes(label = after_stat(rr.label))) +
+  theme_classic()
+```
+
+```{r}
+ees_combined %>%
+  filter(sig & (type == 'wt' | type == '282|297')) %>%
+  pivot_wider(names_from = type, values_from = new_val) %>%
+  ggplot(aes(x = wt, y = `282|297`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  xlim(-3,4) +
+  ylim(-3,4) +
+  stat_cor(label.y = 4, aes(label = after_stat(rr.label))) +
+  theme_classic()
+```
+
+```{r}
+ees_combined %>%
+  filter(sig & (type == 'wt' | type == '282|300')) %>%
+  pivot_wider(names_from = type, values_from = new_val) %>%
+  ggplot(aes(x = wt, y = `282|300`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  xlim(-3,4) +
+  ylim(-3,4) +
+  stat_cor(label.y = 4, aes(label = after_stat(rr.label))) +
+  theme_classic()
+```
+
+```{r}
+ees_combined %>%
+  filter(sig & (type == 'wt' | type == '297|300')) %>%
+  pivot_wider(names_from = type, values_from = new_val) %>%
+  ggplot(aes(x = wt, y = `297|300`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  xlim(-3,4) +
+  ylim(-3,4) +
+  stat_cor(label.y = 4, aes(label = after_stat(rr.label))) +
+  theme_classic()
+```
+
+```{r}
+ees_combined %>%
+  filter(sig & (type == 'wt' | type == '282|297|300')) %>%
+  pivot_wider(names_from = type, values_from = new_val) %>%
+  ggplot(aes(x = wt, y = `282|297|300`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  xlim(-3,4) +
+  ylim(-3,4) +
+  stat_cor(label.y = 4, aes(label = after_stat(rr.label))) +
+  theme_classic()
+```
+
+```{r}
+ees_combined %>%
+  select(c(geno, type, new_val, sig)) %>%
+  filter(sig & (type == 'anc5' | type == '282|297|300')) %>%
+  pivot_wider(names_from = type, values_from = new_val) %>%
+  ggplot(aes(x = anc5, y = `282|297|300`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  xlim(-3,4) +
+  ylim(-3,4) +
+  stat_cor(label.y = 4, aes(label = after_stat(rr.label))) +
+  theme_classic()
+```
+
+```{r}
+ees_combined %>%
+  select(c(geno, type, new_val, sig)) %>%
+  filter(sig & (type == 'wt' | type == 'anc5')) %>%
+  pivot_wider(names_from = type, values_from = new_val) %>%
+  ggplot(aes(x = wt, y = anc5)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  xlim(-3,4) +
+  ylim(-3,4) +
+  stat_cor(label.y = 4, aes(label = after_stat(rr.label))) +
+  theme_classic()
+```
